@@ -1,47 +1,86 @@
 package main
 
 import (
-	"net/http"
+	"flag"
+	"fmt"
 	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"syscall"
 
-	conf "github.com/Derek-X-Wang/relais/pkg/conf/islb"
-	"github.com/Derek-X-Wang/relais/pkg/db"
-	"github.com/Derek-X-Wang/relais/pkg/discovery"
-	"github.com/Derek-X-Wang/relais/pkg/log"
-	"github.com/Derek-X-Wang/relais/pkg/node/islb"
+	log "github.com/pion/ion-log"
+	"github.com/pion/ion/pkg/node/islb"
+	"github.com/spf13/viper"
 )
 
-func init() {
-	log.Init(conf.Log.Level)
+var (
+	conf = islb.Config{}
+	file string
+)
+
+func showHelp() {
+	fmt.Printf("Usage:%s {params}\n", os.Args[0])
+	fmt.Println("      -c {config file}")
+	fmt.Println("      -h (show help info)")
+}
+
+func load() bool {
+	_, err := os.Stat(file)
+	if err != nil {
+		return false
+	}
+
+	viper.SetConfigFile(file)
+	viper.SetConfigType("toml")
+
+	err = viper.ReadInConfig()
+	if err != nil {
+		fmt.Printf("config file %s read failed. %v\n", file, err)
+		return false
+	}
+	err = viper.UnmarshalExact(&conf)
+	if err != nil {
+		fmt.Printf("config file %s loaded failed. %v\n", file, err)
+		return false
+	}
+	fmt.Printf("config %s load ok!\n", file)
+	return true
+}
+
+func parse() bool {
+	flag.StringVar(&file, "c", "configs/islb.toml", "config file")
+	help := flag.Bool("h", false, "help info")
+	flag.Parse()
+	if !load() {
+		return false
+	}
+
+	if *help {
+		showHelp()
+		return false
+	}
+	return true
 }
 
 func main() {
-	log.Infof("--- Starting ISLB Node ---")
-
-	if conf.Global.Pprof != "" {
-		go func() {
-			log.Infof("Start pprof on %s", conf.Global.Pprof)
-			err := http.ListenAndServe(conf.Global.Pprof, nil)
-			if err != nil {
-				panic(err)
-			}
-		}()
+	if !parse() {
+		showHelp()
+		os.Exit(-1)
 	}
 
-	serviceNode := discovery.NewServiceNode(conf.Etcd.Addrs, conf.Global.Dc)
-	serviceNode.RegisterNode("islb", "node-islb", "islb-channel-id")
+	log.Init(conf.Log.Level)
 
-	redisCfg := db.Config{
-		Addrs: conf.Redis.Addrs,
-		Pwd:   conf.Redis.Pwd,
-		DB:    conf.Redis.DB,
+	log.Infof("--- starting islb node ---")
+
+	node := islb.NewISLB(conf.Node.NID)
+	if err := node.Start(conf); err != nil {
+		log.Errorf("islb start error: %v", err)
+		os.Exit(-1)
 	}
-	rpcID := serviceNode.GetRPCChannel()
-	eventID := serviceNode.GetEventChannel()
-	islb.Init(conf.Global.Dc, serviceNode.NodeInfo().ID, rpcID, eventID, redisCfg, conf.Etcd.Addrs, conf.Nats.URL)
+	defer node.Close()
 
-	serviceWatcher := discovery.NewServiceWatcher(conf.Etcd.Addrs, conf.Global.Dc)
-	go serviceWatcher.WatchServiceNode("", islb.WatchServiceNodes)
-
-	select {}
+	// Press Ctrl+C to exit the process
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	<-ch
 }
